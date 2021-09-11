@@ -1,0 +1,208 @@
+org: svenkllnew
+app: serverless
+service:
+  name: sls-todo-app
+
+plugins:
+  - serverless-webpack
+  - serverless-iam-roles-per-function
+
+# package:
+#   individually: true
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-central-1'}
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  environment:
+    AUTH_0_JWKS_URL: https://udacity2021.eu.auth0.com/.well-known/jwks.json
+    TODOS_TABLE: Todos-${self:provider.stage}
+    TODOS_INDEX: TodosIndex
+    SIGNED_URL_EXPIRATION: 300
+    IMAGES_S3_BUCKET: how-sls-todos-images-1234999${self:provider.stage}
+
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - xray:PutTraceSegments
+        - xray:PutTelemetryRecords
+      Resource: "*"
+
+functions:
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  GetTodos:
+    handler: src/lambda/http/getTodos.handler
+    iamRoleStatementsInherit: true
+    events:
+      - http:
+          method: get
+          authorizer: Auth
+          cors: true
+          path: todos
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}/index/${self:provider.environment.TODOS_INDEX}
+
+  CreateTodo:
+    handler: src/lambda/http/createTodo.handler
+    iamRoleStatementsInherit: true
+    events:
+      - http:
+          method: post
+          authorizer: Auth
+          cors: true
+          path: todos
+          request:
+            schema:
+              application/json: ${file(models/create-todo-request.json)}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}
+
+  UpdateTodo:
+    handler: src/lambda/http/updateTodo.handler
+    iamRoleStatementsInherit: true
+    events:
+      - http:
+          method: patch
+          authorizer: Auth
+          cors: true
+          path: todos/{todoId}
+          request:
+            schema:
+              application/json: ${file(models/update-todo-request.json)}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}
+
+  DeleteTodo:
+    handler: src/lambda/http/deleteTodo.handler
+    iamRoleStatementsInherit: true
+    events:
+      - http:
+          method: delete
+          authorizer: Auth
+          cors: true
+          path: todos/{todoId}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}
+
+  GenerateUploadUrl:
+    handler: src/lambda/http/generateUploadUrl.handler
+    iamRoleStatementsInherit: true
+    events:
+      - http:
+          method: post
+          authorizer: Auth
+          cors: true
+          path: todos/{todoId}/attachment
+          iamRoleStatements:
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TODOS_TABLE}
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+          - s3:GetObject
+        Resource: arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*
+
+resources:
+  Resources:
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+
+    TodosDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: userId  #partitiion key
+            AttributeType: S
+          - AttributeName: createdAt  #sortKey
+            AttributeType: S
+          - AttributeName: todoId  #indexKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: todoId
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.TODOS_TABLE}
+        LocalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.TODOS_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    TodoImageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.IMAGES_S3_BUCKET}
+        CorsConfiguration:
+          CorsRules:
+            -
+              AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+    
+    TodoImageBucketReadPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref TodoImageBucket
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicReadForGetBucketObjects
+              Effect: Allow
+              Principal: "*"
+              Action: 's3:GetObject'
+              Resource: 'arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*'
+              Condition:
+                StringLike:
+                  "aws:Referer": "http://localhost:3000/*"
+
+            
